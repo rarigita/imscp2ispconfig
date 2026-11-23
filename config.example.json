@@ -1,0 +1,14 @@
+{
+  "host": "mail.example.net",
+  "api-url": "https://mail.example.net:8080/remote/json.php",
+  "api-user": "migration_api",
+  "client-id": 1,
+  "server-id": 1,
+  "ip": "192.0.2.10",
+  "ssh-user": "imscp",
+  "ssh-key": "/root/.ssh/id_rsa",
+  "exclude-domain": [],
+  "exclude-database": [],
+  "skip-web-domain": [],
+  "mail-merge": []
+}
