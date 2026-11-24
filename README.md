@@ -2,7 +2,7 @@
 
 Herramienta de migración, escrita en Python 3, para trasladar servicios de un servidor **i-MSCP** a otro gestionado con **ISPConfig**, conservando los datos y automatizando parte del aprovisionamiento.
 
-> **Estado:** script de uso administrativo, desarrollado y probado para una migración concreta (i-MSCP 1.5.3 en Debian 10 → ISPConfig 3.3.1 en Debian 13). **No es un migrador universal**. Revise el código, las rutas, los esquemas de las bases de datos y los parámetros antes de usarlo en otro entorno. No hay garantía de compatibilidad con otras versiones.
+> **Estado:** script de uso administrativo, desarrollado y probado para una migración concreta (i-MSCP en Debian 10 → ISPConfig 3.3.1 en Debian 13). **No es un migrador universal**. Revise el código, las rutas, los esquemas de las bases de datos y los parámetros antes de usarlo en otro entorno. No hay garantía de compatibilidad con otras versiones.
 
 ## Objetivos y alcance
 
@@ -23,7 +23,7 @@ El script `migrate.py` permite:
 | Elemento | Origen | Destino |
 | --- | --- | --- |
 | Sistema de referencia | Debian 10 | Debian 13 |
-| Panel de referencia | i-MSCP 1.5.3 | ISPConfig 3.3.1 |
+| Panel de referencia | i-MSCP | ISPConfig 3.3.1 |
 | Ejecución | `root` ejecuta `migrate.py` | Usuario SSH `imscp`, con `sudo` no interactivo |
 | Python | Python **3.7 o superior** | No se requiere Python para la transferencia |
 | Base de datos | MariaDB/MySQL accesible localmente mediante `mysql` | MariaDB/MySQL, base `dbispconfig` consultable por `sudo mysql` |
@@ -414,3 +414,18 @@ config.json
 La sincronizacion `--sync-mail-only` usa `rsync -a --chown=vmail:vmail` con `sudo -n rsync` en destino. No se combinan `--no-owner` ni `--no-group`, porque anularian `--chown` y podrian crear directorios `root:root`, inaccesibles para Dovecot. El destino debe disponer del usuario y grupo `vmail`.
 
 La correccion se aplica a archivos y directorios procesados por rsync; si una ejecucion anterior dejo archivos existentes con propietario incorrecto, `--ignore-existing` no los corrige. En ese caso, revisar y reparar una sola vez la propiedad de los Maildir afectados en el servidor destino, por ejemplo con `sudo chown -R vmail:vmail /var/vmail/example.net/user/Maildir`.
+
+## Versión 9.11: actualización explícita de bases de datos SQL
+
+La opción `--replace-sql` permite actualizar una base de datos de destino que ya contiene tablas cuando su volcado de origen ha cambiado. **Es destructiva**: se elimina y recrea la base de datos de destino, y se importa el volcado actual de origen. No es una sincronización incremental ni combina cambios de ambos servidores.
+
+```bash
+python3 migrate.py --config config.json --apply --domain example.net \
+  --include-sql --import-sql --replace-sql --skip-web --skip-mail --confirm-apply
+```
+
+Antes de reemplazar una base de datos no vacía, el script crea y verifica un volcado comprimido de la base de datos existente en `/var/lib/imscp-migration/sql/backups/` en el servidor destino. Si falla la importación, intenta restaurar automáticamente ese volcado. **No hay garantía de recuperación automática** ante apagones, fallos de disco u otros errores graves: comprobar espacio libre, realizar copias externas y programar una ventana de mantenimiento. Los volcados de respaldo no se eliminan automáticamente.
+
+El reemplazo conserva el nombre y el juego de caracteres/cotejamiento de la base de datos. Si el hash de la exportación coincide con el marcador de una importación previa, la omite. Sin `--replace-sql`, se conserva el comportamiento protector de no sobrescribir bases de datos pobladas.
+
+**Tras el cambio de tráfico a Debian 13**, el destino puede contener datos nuevos. Volver a ejecutar este comando con Debian 10 como origen **eliminaría esos cambios**. No ejecutar después del cambio de tráfico salvo que se haya confirmado que Debian 10 sigue siendo la fuente de verdad y no existen escrituras en Debian 13. Detener escrituras en origen durante el volcado final para asegurar consistencia entre aplicaciones y bases de datos.

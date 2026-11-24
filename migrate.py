@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""i-MSCP -> ISPConfig migration v9.10 (Debian 10, Python >=3.7).
+"""i-MSCP -> ISPConfig migration v9.11 (Debian 10, Python >=3.7).
 
 --inventory/--plan are read-only. --apply uses the ISPConfig remote JSON API to
 provision websites, mail domains, mailboxes, forwards, SQL users and databases,
@@ -155,8 +155,8 @@ def stage_file(host, source, rel):
     return target
 
 
-def import_sql(host, name, staged, local_archive):
-    """Import only into an empty, existing database; never overwrite live tables."""
+def import_sql(host, name, staged, local_archive, replace=False):
+    """Import SQL; explicit replace makes a remote backup and restores on failure."""
     if not IDENT.fullmatch(name):
         raise RuntimeError('Unsafe SQL database name: '+name)
     if not staged.startswith('/home/imscp/imscp-migration-staging/sql/') or not staged.endswith('.sql.gz'):
@@ -173,14 +173,61 @@ def import_sql(host, name, staged, local_archive):
     marker = '/var/lib/imscp-migration/sql/'+name+'.sha256'
     check = 'if test -f {m}; then cat {m}; else echo ABSENT; fi'.format(m=shlex.quote(marker))
     previous = sudo(host, check).strip()
-    if previous != 'ABSENT':
-        if previous == digest:
-            print('EXISTS SQL IMPORT', name, '(matching checksum)')
-            return
-        raise RuntimeError('Existing SQL import marker differs; refusing: '+name)
+    if previous == digest:
+        print('EXISTS SQL IMPORT', name, '(matching checksum)')
+        return
     tables = remote_rows(host, 'SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='+quote_sql(name))
-    if len(tables) != 1 or int(tables[0][0]) != 0:
+    if len(tables) != 1:
+        raise RuntimeError('Cannot inspect destination database: '+name)
+    table_count = int(tables[0][0])
+    if table_count and not replace:
+        if previous != 'ABSENT':
+            raise RuntimeError('Existing SQL import marker differs; use --replace-sql explicitly: '+name)
         raise RuntimeError('Destination database is not empty; SQL import refused: '+name)
+    if previous != 'ABSENT' and not replace:
+        raise RuntimeError('Existing SQL import marker differs; use --replace-sql explicitly: '+name)
+    if replace and table_count:
+        # Back up before any destructive operation. Never overwrite an earlier backup.
+        # MariaDB/MySQL privileges for the schema remain valid after recreation.
+        # Keep original character set/collation for the replacement database.
+        settings = remote_rows(host, 'SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='+quote_sql(name))
+        if len(settings) != 1 or not all(re.fullmatch(r'[A-Za-z0-9_]+', x) for x in settings[0]):
+            raise RuntimeError('Cannot determine destination schema charset/collation: '+name)
+        charset, collation = settings[0]
+        backup = '/var/lib/imscp-migration/sql/backups/'+name+'-'+time.strftime('%Y%m%d-%H%M%S')+'.sql.gz'
+        print('BACKUP SQL', name, '->', backup, flush=True)
+        # A complete backup is required. Refuse replacement if backup fails.
+        backup_cmd = ('set -euo pipefail; mkdir -p {directory}; '
+                      'test ! -e {backup}; '
+                      'mysqldump --single-transaction --quick --routines --triggers '
+                      '--skip-events --no-tablespaces --default-character-set=utf8mb4 {db} '
+                      '| gzip -c > {backup}; gzip -t {backup}').format(
+                          directory=shlex.quote('/var/lib/imscp-migration/sql/backups'),
+                          backup=shlex.quote(backup), db=shlex.quote(name))
+        sudo(host, 'bash -c '+shlex.quote(backup_cmd))
+        print('REPLACE SQL', name, '(backup verified; destination will be recreated)', flush=True)
+        # Do not update marker until successful import. If import fails, attempt
+        # automatic restoration of the previous database from the backup.
+        create_sql = 'CREATE DATABASE `'+name+'` CHARACTER SET '+charset+' COLLATE '+collation
+        drop_sql = 'DROP DATABASE `'+name+'`'
+        restore = ('mysql -e '+shlex.quote(drop_sql+'; '+create_sql)+'; '
+                   'gzip -dc '+shlex.quote(backup)+' | mysql --binary-mode=1 '+shlex.quote(name))
+        replace_cmd = ("set -euo pipefail; test -s {archive}; gzip -t {archive}; "
+                       "mysql -e {recreate}; "
+                       "if ! gzip -dc {archive} | mysql --binary-mode=1 --default-character-set=utf8mb4 {db}; then "
+                       "echo 'SQL replacement failed; restoring prior database' >&2; "
+                       "{restore} || {{ echo 'CRITICAL: automatic restore failed; backup: {backup}' >&2; exit 97; }}; "
+                       "exit 98; fi; "
+                       "mkdir -p /var/lib/imscp-migration/sql; "
+                       "printf '%s\n' {digest} > {marker}").format(
+                           archive=shlex.quote(staged),
+                           recreate=shlex.quote(drop_sql+'; '+create_sql),
+                           db=shlex.quote(name), restore=restore,
+                           backup=shlex.quote(backup), digest=shlex.quote(digest),
+                           marker=shlex.quote(marker))
+        sudo(host, 'bash -c '+shlex.quote(replace_cmd))
+        print('REPLACED SQL', name, 'sha256='+digest[:12], 'backup='+backup)
+        return
     command = ("set -e; test -f {archive}; "
                "gzip -t {archive}; "
                "gzip -dc {archive} | mysql --binary-mode=1 --default-character-set=utf8mb4 {database}; "
@@ -297,7 +344,7 @@ def dump_db(name):
     tmp = Path(str(path)+'.part')
     with tmp.open('wb') as output:
         p1 = subprocess.Popen(['mysqldump', '--single-transaction', '--quick',
-                               '--routines', '--triggers', '--events', '--no-tablespaces',
+                               '--routines', '--triggers', '--skip-events', '--no-tablespaces',
                                '--default-character-set=utf8mb4', name],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         p2 = subprocess.Popen(['gzip', '-c'], stdin=p1.stdout, stdout=output, stderr=subprocess.PIPE)
@@ -838,7 +885,8 @@ def main():
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--host', help='Destination SSH hostname (required for --apply / --sync-mail-only)')
     ap.add_argument('--include-sql', action='store_true')
-    ap.add_argument('--import-sql', action='store_true', help='Import staged SQL into an EMPTY destination DB (requires --include-sql)')
+    ap.add_argument('--import-sql', action='store_true', help='Import staged SQL (requires --include-sql)')
+    ap.add_argument('--replace-sql', action='store_true', help='Explicitly replace nonempty destination SQL databases after creating a remote backup (requires --import-sql)')
     ap.add_argument('--include-dns', action='store_true', help='Preview DNS records; no writes without --dns-apply')
     ap.add_argument('--dns-apply', action='store_true', help='Create DNS records via API')
     ap.add_argument('--create-dns-zones', action='store_true', help='Create missing zones and reconcile Default baseline records')
@@ -899,8 +947,10 @@ def main():
         ap.error('--dry-run requires --sync-mail-only')
     if args.sync_mail_only and (args.include_sql or args.import_sql or args.include_dns or args.dns_apply
                                or args.create_dns_zones or args.activate_mail or args.api_only
-                               or args.skip_mail or args.skip_web or args.dns_ns1 or args.dns_ns2):
+                               or args.skip_mail or args.skip_web or args.dns_ns1 or args.dns_ns2 or args.replace_sql):
         ap.error('--sync-mail-only cannot be combined with provisioning, DNS, SQL, or skip flags')
+    if args.replace_sql and not (args.apply and args.import_sql and args.include_sql):
+        ap.error('--replace-sql requires --apply --include-sql --import-sql')
     if args.import_sql and not args.include_sql:
         ap.error('--import-sql requires --include-sql')
     if args.import_sql and args.api_only:
@@ -1043,7 +1093,7 @@ def main():
                 print('RSYNC STAGE SQL', db['name'], flush=True)
                 staged = stage_file(args.host, str(archive), 'sql/'+archive.name)
                 if args.import_sql:
-                    import_sql(args.host, db['name'], staged, archive)
+                    import_sql(args.host, db['name'], staged, archive, replace=args.replace_sql)
                 else:
                     print('STAGED SQL (not imported):', db['name'])
     print('Finished. ISPConfig resources provisioned. DNS:', 'requested (see CREATED/REVIEW lines)' if args.dns_apply else 'unchanged', '; SQL:', 'import requested' if args.import_sql else 'dumps staged only')
@@ -1055,3 +1105,4 @@ if __name__ == '__main__':
     except (RuntimeError, OSError, ValueError) as exc:
         print('ERROR:', exc, file=sys.stderr)
         sys.exit(1)
+
