@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""i-MSCP -> ISPConfig migration v9.11 (Debian 10, Python >=3.7).
+"""i-MSCP -> ISPConfig migration v9.12 (Debian 10, Python >=3.7).
 
 --inventory/--plan are read-only. --apply uses the ISPConfig remote JSON API to
 provision websites, mail domains, mailboxes, forwards, SQL users and databases,
@@ -248,15 +248,39 @@ def maildir_path(source):
     return None
 
 
-def web_dest(host, hostname):
-    rows = remote_rows(host, 'SELECT domain_id,document_root,system_user,system_group,type FROM web_domain WHERE domain='+quote_sql(hostname))
+def web_dest(host, web):
+    """Resolve the ISPConfig-owned web path; never guess /var/www/clientN/webM."""
+    hostname = web['hostname']
+    rows = remote_rows(host, 'SELECT domain_id,document_root,system_user,system_group,type,parent_domain_id,web_folder '
+                       'FROM web_domain WHERE domain='+quote_sql(hostname))
     if len(rows) != 1:
         raise RuntimeError('Web missing or ambiguous in ISPConfig: '+hostname)
-    ident, root, user, group, typ = rows[0]
+    ident, root, user, group, typ, parent_id, folder = rows[0]
+    if web['kind'] == 'subdomain':
+        if typ != 'vhostsubdomain':
+            # A legacy independent website must not be overwritten or silently converted.
+            print('REVIEW WEB: existing independent site, skipping transfer:', hostname, 'type='+typ)
+            return None
+        parents = remote_rows(host, 'SELECT domain_id,document_root,system_user,system_group,type '
+                              'FROM web_domain WHERE domain='+quote_sql(web['domain']))
+        if len(parents) != 1 or parents[0][4] != 'vhost' or str(parent_id) != str(parents[0][0]):
+            raise RuntimeError('Subdomain has wrong ISPConfig parent: '+hostname)
+        _, parent_root, parent_user, parent_group, _ = parents[0]
+        expected_folder = hostname[:-(len(web['domain'])+1)]
+        if '.' in expected_folder or folder != expected_folder:
+            raise RuntimeError('Subdomain web_folder mismatch for '+hostname+': '+str(folder))
+        if (root, user, group) != (parent_root, parent_user, parent_group):
+            raise RuntimeError('Subdomain root/ownership mismatch with parent: '+hostname)
+        dest = parent_root.rstrip('/')+'/web/'+folder
+    else:
+        if typ != 'vhost':
+            raise RuntimeError('Expected main vhost for '+hostname+', found '+typ)
+        dest = root.rstrip('/')+'/web'
     if not root.startswith('/var/www/') or not user.startswith('web') or not group.startswith('client'):
         raise RuntimeError('Unsafe ISPConfig web ownership/path: '+hostname)
-    # ISPConfig document_root is site root; public files are under /web.
-    return root.rstrip('/')+'/web', user, group
+    if '..' in Path(dest).parts or not dest.startswith('/var/www/'):
+        raise RuntimeError('Unsafe ISPConfig destination path: '+dest)
+    return dest, user, group
 
 
 def mail_dest(host, address):
@@ -441,25 +465,51 @@ def db_rows_by(host, table, key, value, columns):
     return remote_rows(host, 'SELECT '+','.join(columns)+' FROM '+table+' WHERE '+key+'='+quote_sql(value))
 
 
-def provision_web(api, host, hostname, client_id, server_id, ip):
+def provision_web(api, host, web, client_id, server_id, ip):
+    hostname = web['hostname']
+    is_sub = web['kind'] == 'subdomain'
     rows = db_rows_by(host, 'web_domain', 'domain', hostname,
-                      ['domain_id', 'type', 'document_root'])
+                      ['domain_id', 'type', 'parent_domain_id', 'web_folder'])
     if rows:
-        if len(rows) != 1 or rows[0][1] not in ('vhost', 'vhostsubdomain', 'subdomain'):
+        if len(rows) != 1:
             raise RuntimeError('Conflicting existing website: '+hostname)
-        print('EXISTS WEB', hostname)
+        typ = rows[0][1]
+        if is_sub and typ != 'vhostsubdomain':
+            print('REVIEW WEB: existing site is not a vhost subdomain; leaving unchanged:', hostname, 'type='+typ)
+            return
+        if not is_sub and typ != 'vhost':
+            raise RuntimeError('Conflicting existing main website: '+hostname+' type='+typ)
+        print('EXISTS WEB', hostname, 'type='+typ)
         return
-    params = {'server_id': server_id, 'ip_address': ip, 'domain': hostname,
-              'type': 'vhost', 'parent_domain_id': 0, 'vhost_type': 'name',
-              'hd_quota': -1, 'traffic_quota': -1, 'cgi': 'n', 'ssi': 'n',
-              'suexec': 'y', 'errordocs': 1, 'is_subdomainwww': 1,
-              'subdomain': 'www', 'php': 'php-fpm', 'active': 'y',
-              'allow_override': 'All', 'http_port': '80', 'https_port': '443', 'pm': 'dynamic', 'pm_max_children': 10,
-              'pm_start_servers': 2, 'pm_min_spare_servers': 1,
-              'pm_max_spare_servers': 5, 'pm_process_idle_timeout': 10,
-              'pm_max_requests': 0, 'ssl': 'n', 'lets_encrypt': 'n'}
-    result = api.call('sites_web_domain_add', {'client_id': client_id, 'params': params})
-    print('CREATED WEB', hostname, 'id='+str(result))
+    if is_sub:
+        parents = db_rows_by(host, 'web_domain', 'domain', web['domain'],
+                             ['domain_id', 'type', 'server_id'])
+        if len(parents) != 1 or parents[0][1] != 'vhost' or int(parents[0][2]) != server_id:
+            raise RuntimeError('Missing/invalid parent website for subdomain '+hostname)
+        folder = hostname[:-(len(web['domain'])+1)]
+        if not re.fullmatch(r'[a-z0-9-]+', folder):
+            raise RuntimeError('Unsafe subdomain web folder: '+folder)
+        params = {'server_id': server_id, 'ip_address': ip, 'domain': hostname,
+                  'parent_domain_id': int(parents[0][0]), 'web_folder': folder,
+                  'type': 'vhostsubdomain', 'vhost_type': 'name',
+                  'php': 'php-fpm', 'active': 'y', 'suexec': 'y',
+                  'http_port': '80', 'https_port': '443',
+                  'ssl': 'n', 'ssl_letsencrypt': 'n'}
+        method = 'sites_web_vhost_subdomain_add'
+    else:
+        params = {'server_id': server_id, 'ip_address': ip, 'domain': hostname,
+                  'type': 'vhost', 'parent_domain_id': 0, 'vhost_type': 'name',
+                  'hd_quota': -1, 'traffic_quota': -1, 'cgi': 'n', 'ssi': 'n',
+                  'suexec': 'y', 'errordocs': 1, 'is_subdomainwww': 1,
+                  'subdomain': 'www', 'php': 'php-fpm', 'active': 'y',
+                  'allow_override': 'All', 'http_port': '80', 'https_port': '443',
+                  'pm': 'dynamic', 'pm_max_children': 10,
+                  'pm_start_servers': 2, 'pm_min_spare_servers': 1,
+                  'pm_max_spare_servers': 5, 'pm_process_idle_timeout': 10,
+                  'pm_max_requests': 0, 'ssl': 'n', 'lets_encrypt': 'n'}
+        method = 'sites_web_domain_add'
+    result = api.call(method, {'client_id': client_id, 'params': params})
+    print('CREATED WEB', hostname, 'type='+params['type'], 'id='+str(result))
 
 
 def provision_mail_domain(api, host, domain, client_id, server_id, activate=False):
@@ -824,9 +874,9 @@ def mail_forwards(mail):
 
 def provision_resources(api, args, inv, selected):
     # Only API operations in this phase. DNS is handled separately.
-    for web in inv['websites']:
+    for web in sorted(inv['websites'], key=lambda w: (w['kind'] != 'main', w['hostname'])):
         if web['domain'] in selected and not web['skip'] and Path(web['source']).is_dir() and not args.skip_web:
-            provision_web(api, args.host, web['hostname'], args.client_id,
+            provision_web(api, args.host, web, args.client_id,
                           args.server_id, args.ip)
     if not args.skip_mail:
         for domain in sorted(selected):
@@ -1015,7 +1065,7 @@ def main():
         return
     plan = []
     if not args.skip_web:
-        for web in inv['websites']:
+        for web in sorted(inv['websites'], key=lambda w: (w['kind'] != 'main', w['hostname'])):
             if web['domain'] not in selected or web['skip']:
                 continue
             if not Path(web['source']).is_dir():
@@ -1052,7 +1102,14 @@ def main():
         return
     if not args.confirm_apply:
         raise RuntimeError('--apply requires --confirm-apply; review the plan first')
-    sudo(args.host, 'true')
+    # Capture pre-existing subdomains so manually configured sites are never recopied.
+    preexisting_subdomains = set()
+    if not args.skip_web:
+        for kind, item, _source in plan:
+            if kind == 'web' and item['kind'] == 'subdomain':
+                rows = db_rows_by(args.host, 'web_domain', 'domain', item['hostname'], ['domain_id'])
+                if rows:
+                    preexisting_subdomains.add(item['hostname'])
     secret = os.environ.get('ISPC_API_PASSWORD') or getpass.getpass('ISPConfig API password: ')
     api = ISPApi(args.api_url, args.api_user, secret)
     try:
@@ -1068,10 +1125,20 @@ def main():
     time.sleep(5)
     for kind, item, source in plan:
         if kind == 'web':
-            dest, user, group = web_dest(args.host, item['hostname'])
+            resolved = web_dest(args.host, item)
+            if resolved is None:
+                continue
+            if item['kind'] == 'subdomain' and item['hostname'] in preexisting_subdomains:
+                print('REVIEW WEB SUBDOMAIN: skipping automatic file transfer to preserve manually configured content:', item['hostname'])
+                continue
+            dest, user, group = resolved
             print('RSYNC STAGE WEB', item['hostname'], flush=True)
             staged = stage_dir(args.host, source, 'web/'+item['hostname'])
             print('RSYNC INSTALL WEB', item['hostname'], flush=True)
+            if item['kind'] == 'subdomain':
+                sudo(args.host, 'test -d '+shlex.quote(str(Path(dest).parent))+
+                     ' && install -d -o '+shlex.quote(user)+' -g '+shlex.quote(group)+
+                     ' -m 0755 '+shlex.quote(dest))
             install_web(args.host, staged, dest, user, group)
             print('INSTALLED WEB', item['hostname'])
         else:

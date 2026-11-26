@@ -429,3 +429,30 @@ Antes de reemplazar una base de datos no vacía, el script crea y verifica un vo
 El reemplazo conserva el nombre y el juego de caracteres/cotejamiento de la base de datos. Si el hash de la exportación coincide con el marcador de una importación previa, la omite. Sin `--replace-sql`, se conserva el comportamiento protector de no sobrescribir bases de datos pobladas.
 
 **Tras el cambio de tráfico a Debian 13**, el destino puede contener datos nuevos. Volver a ejecutar este comando con Debian 10 como origen **eliminaría esos cambios**. No ejecutar después del cambio de tráfico salvo que se haya confirmado que Debian 10 sigue siendo la fuente de verdad y no existen escrituras en Debian 13. Detener escrituras en origen durante el volcado final para asegurar consistencia entre aplicaciones y bases de datos.
+
+## v9.12: Subdominios Vhost de ISPConfig
+
+El migrador distingue los dominios principales de los subdominios inventariados en i-MSCP.
+Los dominios principales se crean como `vhost`; los subdominios nuevos se crean
+mediante `sites_web_vhost_subdomain_add` como `vhostsubdomain`, vinculados a
+`parent_domain_id`, con `web_folder` igual a la etiqueta del subdominio (por ejemplo,
+`shop.example.org` utiliza `shop`). Se crean primero los dominios principales.
+
+Los archivos de un subdominio nuevo se instalan en la subcarpeta del directorio
+`web` del sitio principal, utilizando los datos de `web_domain` en ISPConfig.
+
+**Protección de sitios existentes:** si el subdominio ya existe antes de ejecutar
+`--apply`, el migrador no modifica su tipo ni copia archivos sobre él. Si existe
+como sitio independiente, informa de que necesita revisión manual. No elimina
+sitios ni convierte automáticamente su tipo.
+
+Prueba sin cambios:
+
+```bash
+python3 migrate.py --config config.json --plan --domain example.org
+```
+
+**Antes de usarlo en producción:** la operación `sites_web_vhost_subdomain_add`
+y el comportamiento de `web_folder` deben validarse en la versión concreta de
+ISPConfig instalada. Esta versión se ha comprobado sintácticamente, pero no se
+ha probado aún contra una instancia real de ISPConfig.
